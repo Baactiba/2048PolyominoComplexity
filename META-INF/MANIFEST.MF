@@ -1,0 +1,7 @@
+Manifest-Version: 1.0
+Main-Class: GuiMain
+Class-Path: C:\Users\13466\Intellij\2048OminoComplexity\out\production\2
+ 048OminoComplexity C:\Users\13466\Intellij\2048OminoComplexity\out\prod
+ uction\2048OminoComplexity\omino2048 C:\Users\13466\Intellij\2048OminoC
+ omplexity\out\production\2048OminoComplexity\omino2048\gui
+
