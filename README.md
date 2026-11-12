@@ -1,3 +1,12 @@
+I created this project with Gemini 3.8 Flash in Antigravity, below is the agent's Readme, but my notes are going to be here at the top of the file.
+
+This project can be used for small polyomino 2048 variants in order to find the success rate of a tile at any given spawn rate. The main goal of this project was to see which variants are the most complex in terms of how many different strategies can be optimal. 
+If you have Java 17+, you should be able to download the folder and run the program with the .bat file, or you can run it through command prompt. If you want to use the .bat, then I would recommend changing "-Xmx32G" to whatever the maximum amount of memory you want to use is (I have it set to 32 gigabytes for my computer).
+Brief analysis of the algorithm, which I came up with and directed Antigravity to implement: First, the tables are solved for the polyomino for one arbitrary spawn rate. While we solve, we can also mark each solved board with a polynomial that represents its success chance, eventually obtaining one or multiple polynomials that represent the optimal strategies at a specific spawn rate. We also solve for the highest suboptimal success rate. Based on the maximum degree of these polynomials and the difference between the optimal and maximum suboptimal success rates, we can calculate a delta-spawnrate at which we can increase and decrease our currently checked spawn rate by and then find the optimal polynomials for those spawn rates and so on. At the end, we are left with many optimal polynomials and we just need to figure out where they intersect and which ones are the maximum. This part is fairly simple. The result is a piecewise that represents the maximum success rate at any spawn rate.
+
+
+
+
 # 2048 Polyomino Complexity
 
 Exact algebraic and numerical analysis of optimal play, strategy transitions, and success probability upper envelopes for arbitrary polyomino board shapes in the 2048 game as a function of the 4-tile spawn rate $x \in [0, 1]$.
