@@ -17,6 +17,23 @@ import java.util.concurrent.CancellationException;
 final class FastEnvelopeDp {
     private static final double ULP_UNIT = 2.220446049250313e-16;
 
+    static final class CallDiagnostics {
+        long durationNanos;
+        long doubleDpNanos;
+        long bfsNanos;
+        long polyNanos;
+        long secondBestNanos;
+        long exactFallbackNanos;
+        String polyStatus = "UNKNOWN";
+        int candCount;
+        int candTested;
+        boolean dubiousZeroGap;
+        boolean secondBestFallback;
+    }
+
+    static final ThreadLocal<CallDiagnostics> lastCallDiagnostics =
+            ThreadLocal.withInitial(CallDiagnostics::new);
+
     static final class PolicySignature {
         private final int[] packedMoves;
         private final int hash;
@@ -387,10 +404,30 @@ final class FastEnvelopeDp {
             Map<PolicySignature, Polynomial> policyCache,
             Workspace ws) {
 
+        CallDiagnostics diag = lastCallDiagnostics.get();
+        diag.durationNanos = 0;
+        diag.doubleDpNanos = 0;
+        diag.bfsNanos = 0;
+        diag.polyNanos = 0;
+        diag.secondBestNanos = 0;
+        diag.exactFallbackNanos = 0;
+        diag.polyStatus = "UNKNOWN";
+        diag.candCount = 0;
+        diag.candTested = 0;
+        diag.dubiousZeroGap = false;
+        diag.secondBestFallback = false;
+
+        long tStart = System.nanoTime();
         boolean needSecondBest = minStepForEarlyExit > 0.0;
         if (requestedSpawnRate.isZero() || requestedSpawnRate.isOne()) {
-            return GameSolver.solveCompiledExact(
+            diag.polyStatus = "BOUNDARY_EXACT";
+            long tEx0 = System.nanoTime();
+            SolveResult boundaryRes = GameSolver.solveCompiledExact(
                     game, requestedSpawnRate, maxEpsilon, maxPolynomials, needSecondBest);
+            long tEx1 = System.nanoTime();
+            diag.exactFallbackNanos = tEx1 - tEx0;
+            diag.durationNanos = tEx1 - tStart;
+            return boundaryRes;
         }
 
         checkCancelled();
@@ -398,9 +435,13 @@ final class FastEnvelopeDp {
         double q = Fraction.ONE.subtract(requestedSpawnRate).doubleValue();
 
         // 1. Certified error-tracked double backward DP
+        long tBeforeDoubleDp = System.nanoTime();
         runCertifiedDoubleDp(game, p, q, ws);
+        long tAfterDoubleDp = System.nanoTime();
+        diag.doubleDpNanos = tAfterDoubleDp - tBeforeDoubleDp;
 
         // 2. Trace reachable policy under bestMove & build exact signature
+        long tBeforeBfs = System.nanoTime();
         int sigLen = 0;
         boolean anyReachableTie = false;
         Arrays.fill(ws.reach, false);
@@ -453,37 +494,56 @@ final class FastEnvelopeDp {
         // Canonical sort signature so BFS insertion order differences never fragment cache keys
         Arrays.sort(ws.packedSigBuf, 0, sigLen);
         PolicySignature sig = new PolicySignature(Arrays.copyOf(ws.packedSigBuf, sigLen));
-        Polynomial optPoly = null;
+        long tAfterBfs = System.nanoTime();
+        diag.bfsNanos = tAfterBfs - tBeforeBfs;
 
+        long tBeforePoly = System.nanoTime();
+        Polynomial optPoly = null;
         if (!anyReachableTie) {
             optPoly = policyCache != null ? policyCache.get(sig) : null;
             if (optPoly == null) {
+                diag.polyStatus = "BUILT_NO_TIE";
                 optPoly = buildPolicyPolyIterative(game, qTail, ws);
                 if (policyCache != null) {
                     policyCache.putIfAbsent(sig, optPoly);
                 }
+            } else {
+                diag.polyStatus = "CACHE_HIT";
             }
         } else {
-            // Verify every reachable tie is an identical-polynomial tie; otherwise fall back to exact Fraction DP.
-            optPoly = verifyTieClosureAndBuildPoly(game, qTail, ws);
+            // Verify reachable ties and resolve any overlapping candidates using exact rational evaluation.
+            optPoly = verifyTieClosureAndBuildPoly(game, qTail, requestedSpawnRate, ws);
             if (optPoly == null) {
+                diag.polyStatus = "EXACT_FALLBACK";
+                long tEx0 = System.nanoTime();
                 SolveResult exactNoSecond = GameSolver.solveCompiledExact(
                         game, requestedSpawnRate, maxEpsilon, maxPolynomials, false);
+                long tEx1 = System.nanoTime();
+                diag.exactFallbackNanos += (tEx1 - tEx0);
+                diag.polyNanos = tEx1 - tBeforePoly;
                 if (!needSecondBest) {
+                    diag.durationNanos = System.nanoTime() - tStart;
                     return exactNoSecond;
                 }
+                long tSb0 = System.nanoTime();
                 Fraction secondFrac = computeFastSecondBestAfterExactFallback(
                         game, exactNoSecond, minStepForEarlyExit, maxDegree, ws);
+                long tSb1 = System.nanoTime();
+                diag.secondBestNanos = tSb1 - tSb0;
+                diag.durationNanos = System.nanoTime() - tStart;
                 return new SolveResult(
                         exactNoSecond.successRate(),
                         exactNoSecond.optimalPolynomials(),
                         exactNoSecond.testedSpawnRate(),
                         secondFrac);
             }
+            diag.polyStatus = "TIE_VERIFIED";
             if (policyCache != null) {
                 policyCache.putIfAbsent(sig, optPoly);
             }
         }
+        long tAfterPoly = System.nanoTime();
+        diag.polyNanos = tAfterPoly - tBeforePoly;
 
         // Compute exact rational start probability M = P(x)
         Fraction exactStartRate = optPoly.evaluate(requestedSpawnRate);
@@ -491,19 +551,27 @@ final class FastEnvelopeDp {
         // 3. Optional fast double 2nd-best bound for Phase 1 certified leaps
         Fraction secondHighest = null;
         if (needSecondBest) {
+            long tBeforeSb = System.nanoTime();
             SecondBestOutcome sb = computeFastSecondBestBound(
                     game, p, q, exactStartRate.doubleValue(), qTail, minStepForEarlyExit, maxDegree, ws);
-            if (sb.requiresExactFallback) {
-                return GameSolver.solveCompiledExact(
-                        game, requestedSpawnRate, maxEpsilon, maxPolynomials, true);
+            long tAfterSb = System.nanoTime();
+            diag.secondBestNanos = tAfterSb - tBeforeSb;
+            diag.candCount = sb.candCount();
+            diag.candTested = sb.candTested();
+            diag.dubiousZeroGap = sb.sawDubiousZeroGap();
+
+            if (sb.requiresExactFallback()) {
+                secondHighest = null;
+            } else {
+                secondHighest = sb.secondRate();
             }
-            secondHighest = sb.secondRate;
         }
 
+        diag.durationNanos = System.nanoTime() - tStart;
         return new SolveResult(exactStartRate, List.of(optPoly), requestedSpawnRate, secondHighest);
     }
 
-    private static void runCertifiedDoubleDp(
+    static void runCertifiedDoubleDp(
             GameSolver.CompiledGame game,
             double p,
             double q,
@@ -597,7 +665,7 @@ final class FastEnvelopeDp {
         }
     }
 
-    private static Polynomial buildPolicyPolyIterative(
+    static Polynomial buildPolicyPolyIterative(
             GameSolver.CompiledGame game,
             int qTail,
             Workspace ws) {
@@ -638,27 +706,28 @@ final class FastEnvelopeDp {
     private static Polynomial verifyTieClosureAndBuildPoly(
             GameSolver.CompiledGame game,
             int qTail,
+            Fraction requestedSpawnRate,
             Workspace ws) {
         Arrays.fill(ws.memoPoly, null);
         for (int id : game.init22Ids) {
-            if (evalVerifiedPoly(id, game, ws) == null) {
+            if (evalVerifiedPoly(id, game, requestedSpawnRate, ws) == null) {
                 return null;
             }
         }
         for (int id : game.init24Ids) {
-            if (evalVerifiedPoly(id, game, ws) == null) {
+            if (evalVerifiedPoly(id, game, requestedSpawnRate, ws) == null) {
                 return null;
             }
         }
         for (int id : game.init44Ids) {
-            if (evalVerifiedPoly(id, game, ws) == null) {
+            if (evalVerifiedPoly(id, game, requestedSpawnRate, ws) == null) {
                 return null;
             }
         }
         return combineRootFastPolys(game, ws.memoPoly);
     }
 
-    private static FastPoly evalVerifiedPoly(int id, GameSolver.CompiledGame game, Workspace ws) {
+    private static FastPoly evalVerifiedPoly(int id, GameSolver.CompiledGame game, Fraction requestedSpawnRate, Workspace ws) {
         FastPoly cached = ws.memoPoly[id];
         if (cached != null) {
             return cached;
@@ -673,7 +742,7 @@ final class FastEnvelopeDp {
             return FastPoly.ZERO;
         }
 
-        FastPoly bestPoly = evalMovePoly(id, bm, game, ws);
+        FastPoly bestPoly = evalMovePoly(id, bm, game, requestedSpawnRate, ws);
         if (bestPoly == null) {
             return null;
         }
@@ -691,9 +760,18 @@ final class FastEnvelopeDp {
                 // Check identical sorted child arrays quickly before recursing into m
                 if (!sameMoveChildMultisets(game.moveChildren2[id][bm], game.moveChildren2[id][m],
                         game.moveChildren4[id][bm], game.moveChildren4[id][m])) {
-                    FastPoly altPoly = evalMovePoly(id, m, game, ws);
-                    if (altPoly == null || !altPoly.samePoly(bestPoly)) {
+                    FastPoly altPoly = evalMovePoly(id, m, game, requestedSpawnRate, ws);
+                    if (altPoly == null) {
                         return null;
+                    }
+                    if (!altPoly.samePoly(bestPoly)) {
+                        // Resolve tie strictly and exactly at requestedSpawnRate
+                        Fraction vBest = bestPoly.toPolynomial().evaluate(requestedSpawnRate);
+                        Fraction vAlt = altPoly.toPolynomial().evaluate(requestedSpawnRate);
+                        int cmp = vAlt.compareTo(vBest);
+                        if (cmp > 0) {
+                            bestPoly = altPoly;
+                        }
                     }
                 }
             }
@@ -703,20 +781,20 @@ final class FastEnvelopeDp {
         return bestPoly;
     }
 
-    private static FastPoly evalMovePoly(int id, int moveIdx, GameSolver.CompiledGame game, Workspace ws) {
+    private static FastPoly evalMovePoly(int id, int moveIdx, GameSolver.CompiledGame game, Fraction requestedSpawnRate, Workspace ws) {
         int[] m2 = game.moveChildren2[id][moveIdx];
         int[] m4 = game.moveChildren4[id][moveIdx];
         int k = m2.length;
         FastPoly s2 = FastPoly.ZERO;
         FastPoly s4 = FastPoly.ZERO;
         for (int i = 0; i < k; i++) {
-            FastPoly p2 = evalVerifiedPoly(m2[i], game, ws);
+            FastPoly p2 = evalVerifiedPoly(m2[i], game, requestedSpawnRate, ws);
             if (p2 == null) {
                 return null;
             }
             s2 = FastPoly.add(s2, p2);
 
-            FastPoly p4 = evalVerifiedPoly(m4[i], game, ws);
+            FastPoly p4 = evalVerifiedPoly(m4[i], game, requestedSpawnRate, ws);
             if (p4 == null) {
                 return null;
             }
@@ -725,7 +803,7 @@ final class FastEnvelopeDp {
         return FastPoly.combineStep(s2, s4, k);
     }
 
-    private static boolean sameMoveChildMultisets(int[] a2, int[] b2, int[] a4, int[] b4) {
+    static boolean sameMoveChildMultisets(int[] a2, int[] b2, int[] a4, int[] b4) {
         int k = a2.length;
         if (k != b2.length) {
             return false;
@@ -747,7 +825,7 @@ final class FastEnvelopeDp {
         return Arrays.equals(ca4, cb4);
     }
 
-    private static Polynomial combineRootFastPolys(GameSolver.CompiledGame game, FastPoly[] memo) {
+    static Polynomial combineRootFastPolys(GameSolver.CompiledGame game, FastPoly[] memo) {
         FastPoly s22 = FastPoly.ZERO;
         for (int id : game.init22Ids) {
             s22 = FastPoly.add(s22, memo[id]);
@@ -769,7 +847,12 @@ final class FastEnvelopeDp {
                 .add(s44.toPolynomial().multiply(w44));
     }
 
-    private record SecondBestOutcome(boolean requiresExactFallback, Fraction secondRate) {}
+    private record SecondBestOutcome(
+            boolean requiresExactFallback,
+            Fraction secondRate,
+            int candCount,
+            int candTested,
+            boolean sawDubiousZeroGap) {}
 
     private static SecondBestOutcome computeFastSecondBestBound(
             GameSolver.CompiledGame game,
@@ -841,7 +924,7 @@ final class FastEnvelopeDp {
         }
 
         if (candCount == 0) {
-            return new SecondBestOutcome(false, null);
+            return new SecondBestOutcome(false, null, 0, 0, false);
         }
 
         // Test lowest first-order loss candidates first so deltaRight < minStep breaks after 1-2 locks!
@@ -858,9 +941,11 @@ final class FastEnvelopeDp {
         double bestSecondStart = -1.0;
         boolean sawDubiousZeroGapCandidate = false;
         double startMarginForExactComparison = Math.max(1e-11, 16.0 * maxReachErr);
+        int candTested = 0;
 
         for (int ci = 0; ci < candCount; ci++) {
             checkCancelled();
+            candTested++;
             int lockedId = ws.candIds[ws.candOrder[ci]];
             double lockedVal = secondMove[lockedId];
             if (lockedVal == opt[lockedId]) {
@@ -948,7 +1033,12 @@ final class FastEnvelopeDp {
                 }
                 double conservativeRight = conservativeRightBound(p, mDouble, safeS, maxDegree);
                 if (conservativeRight - p < minStepForEarlyExit) {
-                    return new SecondBestOutcome(false, conservativeFractionFromDouble(safeS));
+                    return new SecondBestOutcome(
+                            false,
+                            conservativeFractionFromDouble(safeS),
+                            candCount,
+                            candTested,
+                            sawDubiousZeroGapCandidate);
                 }
             } else {
                 sawDubiousZeroGapCandidate = true;
@@ -956,12 +1046,27 @@ final class FastEnvelopeDp {
         }
 
         if (bestSecondStart >= 0.0) {
-            return new SecondBestOutcome(false, conservativeFractionFromDouble(bestSecondStart));
+            return new SecondBestOutcome(
+                    false,
+                    conservativeFractionFromDouble(bestSecondStart),
+                    candCount,
+                    candTested,
+                    sawDubiousZeroGapCandidate);
         }
         if (sawDubiousZeroGapCandidate) {
-            return new SecondBestOutcome(true, null);
+            return new SecondBestOutcome(
+                    true,
+                    null,
+                    candCount,
+                    candTested,
+                    sawDubiousZeroGapCandidate);
         }
-        return new SecondBestOutcome(false, null);
+        return new SecondBestOutcome(
+                false,
+                null,
+                candCount,
+                candTested,
+                sawDubiousZeroGapCandidate);
     }
 
     private static Fraction computeFastSecondBestAfterExactFallback(
@@ -1020,9 +1125,7 @@ final class FastEnvelopeDp {
         SecondBestOutcome sb = computeFastSecondBestBound(
                 game, p, q, exactNoSecond.successRate().doubleValue(), qTail, minStepForEarlyExit, maxDegree, ws);
         if (sb.requiresExactFallback) {
-            SolveResult full = GameSolver.solveCompiledExact(
-                    game, x, Fraction.ZERO, GameSolver.DEFAULT_MAX_POLYNOMIALS, true);
-            return full.secondHighestSuccessRate();
+            return null;
         }
         return sb.secondRate;
     }
@@ -1072,10 +1175,16 @@ final class FastEnvelopeDp {
     }
 
     private static double conservativeRightBound(double x0, double m, double s, int maxDegree) {
+        int D = Math.max(1, maxDegree);
+        double gapDiff = Math.max(0.0, Math.min(1.0, m - s));
+        double h2 = Math.asin(gapDiff) / (2.0 * D);
+
         double uM = Math.max(-1.0, Math.min(1.0, 2.0 * m - 1.0));
         double uS = Math.max(-1.0, Math.min(1.0, 2.0 * s - 1.0));
-        double g = Math.max(0.0, Math.asin(uM) - Math.asin(uS));
-        double h = g / (8.0 * Math.max(1, maxDegree));
+        double g3 = Math.max(0.0, Math.asin(uM) - Math.asin(uS));
+        double h3 = g3 / (8.0 * D);
+
+        double h = Math.max(h2, h3);
         double t = Math.asin(Math.sqrt(Math.max(0.0, Math.min(1.0, x0))));
         double tRight = t + h;
         return (tRight >= Math.PI / 2.0) ? 1.0 : Math.pow(Math.sin(tRight), 2);
@@ -1090,6 +1199,9 @@ final class FastEnvelopeDp {
     private static void checkCancelled() {
         if (Thread.currentThread().isInterrupted()) {
             throw new CancellationException("Solve cancelled");
+        }
+        if (EnvelopeSolver.isCutoffTriggered()) {
+            throw new EnvelopeSolver.CutoffReachedException("Cutoff limit reached");
         }
     }
 }

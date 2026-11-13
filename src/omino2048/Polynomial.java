@@ -179,6 +179,20 @@ public final class Polynomial {
     }
 
     /**
+     * Evaluates P(x) in floating point using Horner's method.
+     */
+    public double evaluate(double x) {
+        if (isZero()) {
+            return 0.0;
+        }
+        double result = 0.0;
+        for (int i = coefficients.size() - 1; i >= 0; i--) {
+            result = result * x + coefficients.get(i).doubleValue();
+        }
+        return result;
+    }
+
+    /**
      * Evaluates P(x) exactly using Horner's method.
      */
     public Fraction evaluate(Fraction x) {

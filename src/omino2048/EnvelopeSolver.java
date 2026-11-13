@@ -38,6 +38,63 @@ public final class EnvelopeSolver {
     public static final double DEFAULT_MIN_STEP = 1e-4;
     private static final int MAX_REFINEMENT_ROUNDS = 8;
 
+    public static class CutoffReachedException extends RuntimeException {
+        public CutoffReachedException(String message) {
+            super(message);
+        }
+    }
+
+    public interface CallRecordConsumer {
+        void accept(
+                int callIndex,
+                String threadName,
+                int chunkIndex,
+                Fraction xFrac,
+                double xVal,
+                long durationNanos,
+                long doubleDpNanos,
+                long bfsNanos,
+                long polyNanos,
+                long secondBestNanos,
+                long exactFallbackNanos,
+                String polyStatus,
+                int candCount,
+                int candTested,
+                boolean dubiousZeroGap,
+                boolean secondBestFallback,
+                double optRate,
+                Double secondRate,
+                double deltaRight,
+                boolean isLeap);
+    }
+
+    private static volatile int globalCutoffLimit = 0;
+    private static volatile CallRecordConsumer globalCallConsumer = null;
+    private static volatile boolean cutoffTriggered = false;
+
+    public static void setCallCutoff(int cutoff) {
+        globalCutoffLimit = cutoff;
+        cutoffTriggered = false;
+    }
+
+    public static void setCallConsumer(CallRecordConsumer consumer) {
+        globalCallConsumer = consumer;
+    }
+
+    public static boolean isCutoffTriggered() {
+        return cutoffTriggered;
+    }
+
+    public static void signalCutoff() {
+        cutoffTriggered = true;
+    }
+
+    public static void resetCallInstrumentation() {
+        globalCutoffLimit = 0;
+        globalCallConsumer = null;
+        cutoffTriggered = false;
+    }
+
     public static int defaultThreads() {
         return Math.max(1, Math.min(12, Runtime.getRuntime().availableProcessors()));
     }
@@ -243,7 +300,7 @@ public final class EnvelopeSolver {
                                 game, maxDegree, maxEpsilon, maxPolynomials, minStep,
                                 leftS.certifiedRight(), rightS.certifiedLeft(),
                                 candidatePolys, testedPoints, allSamples, totalSolverCalls,
-                                policyCache, threadWs.get());
+                                policyCache, threadWs.get(), sharedCallCounter, -1);
                     }
                 }
             }
@@ -342,6 +399,9 @@ public final class EnvelopeSolver {
         Fraction lastProgressX = Fraction.MINUS_ONE;
         double prevCertifiedRight = chunkLoDouble;
         boolean prevWasCertifiedLeap = false;
+        Polynomial prevPoly = null;
+        double optimisticStride = minStep;
+        double maxOptimisticStride = Math.min(0.04, Math.max(minStep * 32.0, 0.01));
 
         while (true) {
             checkCancelled();
@@ -387,6 +447,38 @@ public final class EnvelopeSolver {
             boolean currentLeap = deltaRight >= minStep;
             localSamples.add(new SampleRecord(x0Frac, x0, bounds.left(), bounds.right(), currentLeap, res));
 
+            CallRecordConsumer consumer = globalCallConsumer;
+            if (consumer != null) {
+                FastEnvelopeDp.CallDiagnostics diag = FastEnvelopeDp.lastCallDiagnostics.get();
+                Double sRate = res.secondHighestSuccessRate() != null ? res.secondHighestSuccessRate().doubleValue() : null;
+                consumer.accept(
+                        globalCall,
+                        Thread.currentThread().getName(),
+                        chunkIndex,
+                        x0Frac,
+                        x0,
+                        diag.durationNanos,
+                        diag.doubleDpNanos,
+                        diag.bfsNanos,
+                        diag.polyNanos,
+                        diag.secondBestNanos,
+                        diag.exactFallbackNanos,
+                        diag.polyStatus,
+                        diag.candCount,
+                        diag.candTested,
+                        diag.dubiousZeroGap,
+                        diag.secondBestFallback,
+                        res.successRate().doubleValue(),
+                        sRate,
+                        deltaRight,
+                        currentLeap);
+            }
+
+            if (globalCutoffLimit > 0 && globalCall >= globalCutoffLimit) {
+                cutoffTriggered = true;
+                throw new CutoffReachedException("Cutoff reached at " + globalCall + " calls");
+            }
+
             // Only verify two-sided gap [prevCertifiedRight, bounds.left()] within the owned range.
             if (prevWasCertifiedLeap
                     && bounds.left() > prevCertifiedRight + Math.max(1e-12, minStep * 0.5)
@@ -395,7 +487,7 @@ public final class EnvelopeSolver {
                         game, maxDegree, maxEpsilon, maxPolynomials, minStep,
                         prevCertifiedRight, Math.min(chunkHiDouble, bounds.left()),
                         localPolySeen, localTestedSet, localSamples, localCalls,
-                        policyCache, ws);
+                        policyCache, ws, sharedCallCounter, chunkIndex);
             }
             prevCertifiedRight = Math.max(prevCertifiedRight, bounds.right());
 
@@ -421,22 +513,62 @@ public final class EnvelopeSolver {
                 continue;
             }
 
+            Polynomial curPoly = res.optimalPolynomials().isEmpty() ? null : res.optimalPolynomials().get(0);
             double nextTarget;
             double loRatio;
             if (currentLeap) {
                 nextTarget = Math.min(chunkHiDouble, x0 + 1.8 * deltaRight);
                 loRatio = 0.65;
                 prevWasCertifiedLeap = true;
+                optimisticStride = minStep;
             } else if (res.secondHighestSuccessRate() == null) {
                 double step = Math.max(minStep, 1.0 / 256.0);
                 nextTarget = Math.min(chunkHiDouble, x0 + step);
                 loRatio = 0.8;
                 prevWasCertifiedLeap = false;
+                optimisticStride = minStep;
             } else {
-                nextTarget = Math.min(chunkHiDouble, x0 + minStep);
-                loRatio = 0.8;
+                // Optimistic Jump Logic:
+                // When certified leap is below minStep, adaptively expand the step if the
+                // optimal policy continues to be confirmed.
+                boolean samePoly = curPoly != null && curPoly.equals(prevPoly);
+                if (samePoly) {
+                    optimisticStride = Math.min(maxOptimisticStride, optimisticStride * 1.5);
+                } else {
+                    optimisticStride = minStep;
+                }
+
+                // Check distance to nearest crossing with known candidate polynomials in localPolySeen
+                double nearestKnownCrossing = Double.POSITIVE_INFINITY;
+                if (curPoly != null && localPolySeen.size() > 1) {
+                    for (Polynomial other : localPolySeen) {
+                        if (other.equals(curPoly)) continue;
+                        double curVal = curPoly.evaluate(x0 + optimisticStride);
+                        double otherVal = other.evaluate(x0 + optimisticStride);
+                        if (otherVal > curVal) {
+                            Polynomial diff = curPoly.subtract(other);
+                            double rLo = x0, rHi = x0 + optimisticStride;
+                            for (int iter = 0; iter < 16; iter++) {
+                                double rMid = 0.5 * (rLo + rHi);
+                                if (diff.evaluate(rMid) < 0) rHi = rMid;
+                                else rLo = rMid;
+                            }
+                            double rootDist = Math.max(minStep, rHi - x0);
+                            if (rootDist < nearestKnownCrossing) {
+                                nearestKnownCrossing = rootDist;
+                            }
+                        }
+                    }
+                }
+                if (Double.isFinite(nearestKnownCrossing)) {
+                    optimisticStride = Math.max(minStep, Math.min(optimisticStride, nearestKnownCrossing * 0.9));
+                }
+
+                nextTarget = Math.min(chunkHiDouble, x0 + optimisticStride);
+                loRatio = (optimisticStride > 2.0 * minStep) ? 0.7 : 0.8;
                 prevWasCertifiedLeap = false;
             }
+            prevPoly = curPoly;
 
             double loDouble = x0 + loRatio * (nextTarget - x0);
             if (nextTarget >= chunkHiDouble - 1e-12 || loDouble >= chunkHiDouble - 1e-12) {
@@ -507,6 +639,9 @@ public final class EnvelopeSolver {
         if (Thread.currentThread().isInterrupted()) {
             throw new CancellationException("Solve cancelled");
         }
+        if (cutoffTriggered) {
+            throw new CutoffReachedException("Cutoff limit reached");
+        }
     }
 
     private record Bounds(double left, double right) {}
@@ -518,10 +653,19 @@ public final class EnvelopeSolver {
         }
         double m = clampUnitDouble(res.successRate().doubleValue());
         double s = clampUnitDouble(sFrac.doubleValue());
+
+        // Method 2: Arcsine bound on difference polynomial (g = M - S, denom = 2D)
+        double gapDiff = Math.max(0.0, Math.min(1.0, m - s));
+        double h2 = Math.asin(gapDiff) / (2.0 * Math.max(1, maxDegree));
+
+        // Method 3: Arcsine bound on individual polynomials (denom = 8D)
         double uM = Math.max(-1.0, Math.min(1.0, 2.0 * m - 1.0));
         double uS = Math.max(-1.0, Math.min(1.0, 2.0 * s - 1.0));
-        double g = Math.max(0.0, Math.asin(uM) - Math.asin(uS));
-        double h = g / (8.0 * Math.max(1, maxDegree));
+        double g3 = Math.max(0.0, Math.asin(uM) - Math.asin(uS));
+        double h3 = g3 / (8.0 * Math.max(1, maxDegree));
+
+        // Composite bound: take the maximum guaranteed radius of both methods
+        double h = Math.max(h2, h3);
         double t = Math.asin(Math.sqrt(clampUnitDouble(x0)));
 
         double tRight = t + h;
@@ -545,7 +689,9 @@ public final class EnvelopeSolver {
             List<SampleRecord> samples,
             int[] solverCalls,
             ConcurrentHashMap<FastEnvelopeDp.PolicySignature, Polynomial> policyCache,
-            FastEnvelopeDp.Workspace ws) {
+            FastEnvelopeDp.Workspace ws,
+            AtomicInteger sharedCallCounter,
+            int chunkIndex) {
 
         double cursor = gapStart;
         int guard = 0;
@@ -561,13 +707,48 @@ public final class EnvelopeSolver {
             SolveResult res = FastEnvelopeDp.solveForEnvelope(
                     game, probe, maxEpsilon, maxPolynomials, minStep, maxDegree, policyCache, ws);
             solverCalls[0]++;
+            int gapCall = sharedCallCounter.incrementAndGet();
             testedPoints.add(res.testedSpawnRate());
             addEnvelopeRelevantPolynomials(res, candidatePolys);
 
             double x = clampUnitDouble(res.testedSpawnRate().doubleValue());
             Bounds b = computeDeltaBounds(x, res, maxDegree);
-            boolean isLeap = b.right() - x >= minStep;
+            double deltaRight = Math.max(0.0, b.right() - x);
+            boolean isLeap = deltaRight >= minStep;
             samples.add(new SampleRecord(res.testedSpawnRate(), x, b.left(), b.right(), isLeap, res));
+
+            CallRecordConsumer consumer = globalCallConsumer;
+            if (consumer != null) {
+                FastEnvelopeDp.CallDiagnostics diag = FastEnvelopeDp.lastCallDiagnostics.get();
+                Double sRate = res.secondHighestSuccessRate() != null ? res.secondHighestSuccessRate().doubleValue() : null;
+                consumer.accept(
+                        gapCall,
+                        Thread.currentThread().getName(),
+                        chunkIndex,
+                        res.testedSpawnRate(),
+                        x,
+                        diag.durationNanos,
+                        diag.doubleDpNanos,
+                        diag.bfsNanos,
+                        diag.polyNanos,
+                        diag.secondBestNanos,
+                        diag.exactFallbackNanos,
+                        diag.polyStatus,
+                        diag.candCount,
+                        diag.candTested,
+                        diag.dubiousZeroGap,
+                        diag.secondBestFallback,
+                        res.successRate().doubleValue(),
+                        sRate,
+                        deltaRight,
+                        isLeap);
+            }
+
+            if (globalCutoffLimit > 0 && gapCall >= globalCutoffLimit) {
+                cutoffTriggered = true;
+                throw new CutoffReachedException("Cutoff reached at " + gapCall + " calls");
+            }
+
             double advanced = Math.max(b.right(), x + minStep);
             if (advanced <= cursor + 1e-12) {
                 break;

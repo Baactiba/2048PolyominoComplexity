@@ -5,8 +5,10 @@ out/
 .idea/workspace.xml
 .idea/shelf/
 .idea/httpRequests/
+.idea/vcs.xml
 
 ### Temporary / Build ###
+scratch/
 out_test/
 out_verify/
 dist/
