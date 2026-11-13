@@ -43,10 +43,20 @@ public final class PlottedEnvelope {
             Polynomial polynomial,
             Color color,
             BigDecimal[] coeffsAsc,
-            List<EnvelopeSegment> activeSegments) {
+            double[] doubleCoeffsAsc,
+            List<EnvelopeSegment> activeSegments,
+            String cachedActiveIntervals,
+            String cachedShortPoly) {
 
         public double evaluateDouble(double x) {
-            return evaluateBigDecimal(x).doubleValue();
+            if (doubleCoeffsAsc.length == 0) {
+                return 0.0;
+            }
+            double acc = 0.0;
+            for (int i = doubleCoeffsAsc.length - 1; i >= 0; i--) {
+                acc = acc * x + doubleCoeffsAsc[i];
+            }
+            return acc;
         }
 
         public BigDecimal evaluateBigDecimal(double x) {
@@ -62,15 +72,11 @@ public final class PlottedEnvelope {
         }
 
         public String activeIntervalsSummary() {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < activeSegments.size(); i++) {
-                if (i > 0) {
-                    sb.append(", ");
-                }
-                EnvelopeSegment seg = activeSegments.get(i);
-                sb.append('[').append(seg.formatStart()).append(", ").append(seg.formatEnd()).append(']');
-            }
-            return sb.toString();
+            return cachedActiveIntervals;
+        }
+
+        public String shortPolySummary() {
+            return cachedShortPoly;
         }
     }
 
@@ -118,18 +124,35 @@ public final class PlottedEnvelope {
             Polynomial poly = distinct.get(i);
             List<Fraction> fracCoeffs = poly.getCoefficients();
             BigDecimal[] decCoeffs = new BigDecimal[fracCoeffs.size()];
+            double[] dCoeffs = new double[fracCoeffs.size()];
             for (int d = 0; d < fracCoeffs.size(); d++) {
                 Fraction c = fracCoeffs.get(d);
                 decCoeffs[d] = new BigDecimal(c.getNumerator())
                         .divide(new BigDecimal(c.getDenominator()), HIGH_PREC);
+                dCoeffs[d] = c.doubleValue();
             }
+            List<EnvelopeSegment> activeSegs = List.copyOf(segsByPoly.getOrDefault(poly, List.of()));
+            StringBuilder intSb = new StringBuilder();
+            for (int k = 0; k < activeSegs.size(); k++) {
+                if (k > 0) {
+                    intSb.append(", ");
+                }
+                EnvelopeSegment seg = activeSegs.get(k);
+                intSb.append('[').append(seg.formatStart()).append(", ").append(seg.formatEnd()).append(']');
+            }
+            String polyStr = poly.toString();
+            String shortPoly = polyStr.length() > 34 ? polyStr.substring(0, 31) + "..." : polyStr;
+
             StrategyCurve curve = new StrategyCurve(
                     i,
                     "S" + (i + 1),
                     poly,
                     colorForIndex(i),
                     decCoeffs,
-                    List.copyOf(segsByPoly.getOrDefault(poly, List.of())));
+                    dCoeffs,
+                    activeSegs,
+                    intSb.toString(),
+                    shortPoly);
             curves.add(curve);
             polyMap.put(poly, curve);
         }

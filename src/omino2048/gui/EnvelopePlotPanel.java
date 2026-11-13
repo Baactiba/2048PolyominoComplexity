@@ -101,8 +101,6 @@ public final class EnvelopePlotPanel extends JPanel {
     // Cached curve evaluation across the visible x window.
     private double cachedMinX = Double.NaN;
     private double cachedMaxX = Double.NaN;
-    private boolean cachedLogTailY = false;
-    private double cachedLogTailDecades = Double.NaN;
     private PlottedEnvelope cachedEnvelope = null;
     private double[] sampleXs = new double[0];
     private double[][] sampleYs = new double[0][0];
@@ -284,7 +282,6 @@ public final class EnvelopePlotPanel extends JPanel {
     public void setLogTailY(boolean logTailY) {
         if (this.logTailY != logTailY) {
             this.logTailY = logTailY;
-            cachedEnvelope = null;
             refreshHoverReadout();
             repaint();
         }
@@ -300,7 +297,6 @@ public final class EnvelopePlotPanel extends JPanel {
         }
         if (Math.abs(this.logTailDecades - decades) > 1e-12) {
             this.logTailDecades = decades;
-            cachedEnvelope = null;
             refreshHoverReadout();
             repaint();
         }
@@ -352,9 +348,7 @@ public final class EnvelopePlotPanel extends JPanel {
         }
         if (cachedEnvelope == plotted
                 && Math.abs(cachedMinX - viewMinX) < 1e-12
-                && Math.abs(cachedMaxX - viewMaxX) < 1e-12
-                && cachedLogTailY == logTailY
-                && (!logTailY || Math.abs(cachedLogTailDecades - logTailDecades) < 1e-12)) {
+                && Math.abs(cachedMaxX - viewMaxX) < 1e-12) {
             return;
         }
         TreeSet<Double> xsSet = new TreeSet<>();
@@ -363,18 +357,16 @@ public final class EnvelopePlotPanel extends JPanel {
         for (int i = 0; i <= gridSamples; i++) {
             xsSet.add(viewMinX + (span * i) / gridSamples);
         }
-        // Extra log-clustered x samples near endpoints x=0 and x=1 so stretched log-tail slopes stay silky smooth.
-        if (logTailY) {
-            for (int e = 1; e <= 6; e++) {
-                for (double m : new double[]{1.0, 2.0, 3.0, 5.0, 7.0}) {
-                    double xLo = m * Math.pow(10.0, -e);
-                    if (xLo > viewMinX && xLo < viewMaxX) {
-                        xsSet.add(xLo);
-                    }
-                    double xHi = 1.0 - xLo;
-                    if (xHi > viewMinX && xHi < viewMaxX) {
-                        xsSet.add(xHi);
-                    }
+        // Clustered endpoint samples near 0 and 1 so steep slopes remain smooth under any scale
+        for (int e = 1; e <= 6; e++) {
+            for (double m : new double[]{1.0, 2.0, 3.0, 5.0, 7.0}) {
+                double xLo = m * Math.pow(10.0, -e);
+                if (xLo > viewMinX && xLo < viewMaxX) {
+                    xsSet.add(xLo);
+                }
+                double xHi = 1.0 - xLo;
+                if (xHi > viewMinX && xHi < viewMaxX) {
+                    xsSet.add(xHi);
                 }
             }
         }
@@ -410,8 +402,6 @@ public final class EnvelopePlotPanel extends JPanel {
         this.cachedEnvelope = plotted;
         this.cachedMinX = viewMinX;
         this.cachedMaxX = viewMaxX;
-        this.cachedLogTailY = logTailY;
-        this.cachedLogTailDecades = logTailDecades;
     }
 
     private void updateHover(Point point) {
@@ -665,40 +655,66 @@ public final class EnvelopePlotPanel extends JPanel {
         }
         Composite oldComp = g2.getComposite();
         List<PlottedEnvelope.StrategyCurve> strategies = plotted.strategies();
-        for (int pass = 0; pass < 2; pass++) {
-            boolean drawingHighlightPass = pass == 1;
-            for (int s = 0; s < strategies.size(); s++) {
-                boolean isHighlighted = s == highlightedStrategyIndex;
-                if (drawingHighlightPass != isHighlighted) {
-                    continue;
-                }
-                PlottedEnvelope.StrategyCurve curve = strategies.get(s);
-                float alpha;
-                if (isHighlighted) {
-                    alpha = 0.92f;
-                } else if (highlightedStrategyIndex >= 0) {
-                    alpha = 0.20f;
-                } else {
-                    alpha = strategies.size() > 15 ? 0.48f : 0.65f;
-                }
-                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
-                g2.setColor(curve.color());
-                g2.setStroke(isHighlighted ? OFF_FRONTIER_HIGHLIGHT_STROKE : OFF_FRONTIER_STROKE);
 
-                Path2D.Double path = new Path2D.Double();
-                double[] ys = sampleYs[s];
-                for (int i = 0; i < sampleXs.length; i++) {
-                    double px = xToPixel(sampleXs[i], plot);
-                    double py = yToPixel(ys[i], plot);
-                    if (i == 0) {
-                        path.moveTo(px, py);
-                    } else {
-                        path.lineTo(px, py);
-                    }
-                }
-                g2.draw(path);
+        // 1. Draw all unhighlighted background curves in a single pass with shared composite/stroke
+        float baseAlpha = (highlightedStrategyIndex >= 0)
+                ? 0.20f
+                : (strategies.size() > 15 ? 0.48f : 0.65f);
+        g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, baseAlpha));
+        g2.setStroke(OFF_FRONTIER_STROKE);
+
+        int nPts = sampleXs.length;
+        for (int s = 0; s < strategies.size(); s++) {
+            if (s == highlightedStrategyIndex) {
+                continue;
             }
+            PlottedEnvelope.StrategyCurve curve = strategies.get(s);
+            g2.setColor(curve.color());
+
+            Path2D.Double path = new Path2D.Double();
+            double[] ys = sampleYs[s];
+            double prevPx = Double.NaN;
+            double prevPy = Double.NaN;
+            for (int i = 0; i < nPts; i++) {
+                double px = xToPixel(sampleXs[i], plot);
+                double py = yToPixel(ys[i], plot);
+                if (i == 0) {
+                    path.moveTo(px, py);
+                    prevPx = px;
+                    prevPy = py;
+                } else {
+                    if (i < nPts - 1 && Math.abs(px - prevPx) < 0.75 && Math.abs(py - prevPy) < 0.75) {
+                        continue;
+                    }
+                    path.lineTo(px, py);
+                    prevPx = px;
+                    prevPy = py;
+                }
+            }
+            g2.draw(path);
         }
+
+        // 2. Draw highlighted curve on top, if any
+        if (highlightedStrategyIndex >= 0 && highlightedStrategyIndex < strategies.size()) {
+            PlottedEnvelope.StrategyCurve curve = strategies.get(highlightedStrategyIndex);
+            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.92f));
+            g2.setStroke(OFF_FRONTIER_HIGHLIGHT_STROKE);
+            g2.setColor(curve.color());
+
+            Path2D.Double path = new Path2D.Double();
+            double[] ys = sampleYs[highlightedStrategyIndex];
+            for (int i = 0; i < nPts; i++) {
+                double px = xToPixel(sampleXs[i], plot);
+                double py = yToPixel(ys[i], plot);
+                if (i == 0) {
+                    path.moveTo(px, py);
+                } else {
+                    path.lineTo(px, py);
+                }
+            }
+            g2.draw(path);
+        }
+
         g2.setComposite(oldComp);
     }
 
@@ -707,7 +723,10 @@ public final class EnvelopePlotPanel extends JPanel {
             return;
         }
         Composite oldComp = g2.getComposite();
-        for (int pass = 0; pass < 2; pass++) {
+        boolean hasHighlight = highlightedStrategyIndex >= 0;
+        int passLimit = hasHighlight ? 2 : 1;
+
+        for (int pass = 0; pass < passLimit; pass++) {
             boolean drawingHighlightPass = pass == 1;
             for (PlottedEnvelope.SegmentEntry entry : plotted.segments()) {
                 double segStart = entry.startX();
@@ -721,7 +740,7 @@ public final class EnvelopePlotPanel extends JPanel {
                     continue;
                 }
 
-                float alpha = (highlightedStrategyIndex >= 0 && !isHighlighted) ? 0.35f : 1.0f;
+                float alpha = (hasHighlight && !isHighlighted) ? 0.35f : 1.0f;
                 g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
                 g2.setColor(curve.color());
                 g2.setStroke(isHighlighted ? FRONTIER_HIGHLIGHT_STROKE : FRONTIER_STROKE);
@@ -735,14 +754,23 @@ public final class EnvelopePlotPanel extends JPanel {
                 double[] ys = sampleYs[curve.index()];
                 boolean started = false;
                 if (idxStart <= idxEnd && idxStart < sampleXs.length && idxEnd >= 0) {
+                    double prevPx = Double.NaN;
+                    double prevPy = Double.NaN;
                     for (int i = idxStart; i <= idxEnd; i++) {
                         double px = xToPixel(sampleXs[i], plot);
                         double py = yToPixel(ys[i], plot);
                         if (!started) {
                             path.moveTo(px, py);
                             started = true;
+                            prevPx = px;
+                            prevPy = py;
                         } else {
+                            if (i < idxEnd && Math.abs(px - prevPx) < 0.75 && Math.abs(py - prevPy) < 0.75) {
+                                continue;
+                            }
                             path.lineTo(px, py);
+                            prevPx = px;
+                            prevPy = py;
                         }
                     }
                 }
@@ -926,21 +954,7 @@ public final class EnvelopePlotPanel extends JPanel {
         markRect(occ, gw, gh, plot, cell, plot.x + plot.width - 4, plot.y, plot.x + plot.width, plot.y + plot.height, (byte) 2);
 
         if (sampleXs.length >= 2) {
-            if (showOffFrontier) {
-                for (int s = 0; s < sampleYs.length; s++) {
-                    double[] ys = sampleYs[s];
-                    double prevPx = xToPixel(sampleXs[0], plot);
-                    double prevPy = yToPixel(ys[0], plot);
-                    for (int i = 1; i < sampleXs.length; i++) {
-                        double curPx = xToPixel(sampleXs[i], plot);
-                        double curPy = yToPixel(ys[i], plot);
-                        markSegment(occ, gw, gh, plot, cell, prevPx, prevPy, curPx, curPy, 3, (byte) 1);
-                        prevPx = curPx;
-                        prevPy = curPy;
-                    }
-                }
-            }
-
+            // Mark active frontier segments with safety padding so labels avoid cutting through envelope
             for (PlottedEnvelope.SegmentEntry entry : plotted.segments()) {
                 double segStart = entry.startX();
                 double segEnd = entry.endX();

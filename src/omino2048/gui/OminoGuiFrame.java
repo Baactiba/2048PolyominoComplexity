@@ -677,48 +677,49 @@ public final class OminoGuiFrame extends JFrame {
         solverStatusLabel.setText("Copied exact envelope summary to clipboard.");
     }
 
-    private static final class StrategyCellRenderer extends DefaultListCellRenderer {
+    private static final class StrategyCellRenderer extends JPanel implements javax.swing.ListCellRenderer<Object> {
+        private final JPanel swatch = new JPanel();
+        private final JLabel topLabel = new JLabel();
+        private final JLabel bottomLabel = new JLabel();
+
+        StrategyCellRenderer() {
+            super(new BorderLayout(8, 2));
+            setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+
+            swatch.setPreferredSize(new Dimension(14, 14));
+            swatch.setBorder(BorderFactory.createLineBorder(Color.DARK_GRAY));
+
+            JPanel swatchWrap = new JPanel(new GridBagLayout());
+            swatchWrap.setOpaque(false);
+            swatchWrap.add(swatch);
+            add(swatchWrap, BorderLayout.WEST);
+
+            topLabel.setFont(topLabel.getFont().deriveFont(Font.BOLD, 11.5f));
+            bottomLabel.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+
+            JPanel textStack = new JPanel(new GridLayout(2, 1, 0, 1));
+            textStack.setOpaque(false);
+            textStack.add(topLabel);
+            textStack.add(bottomLabel);
+            add(textStack, BorderLayout.CENTER);
+        }
+
         @Override
         public Component getListCellRendererComponent(
                 JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
-            JPanel row = new JPanel(new BorderLayout(8, 2));
-            row.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
-            row.setBackground(isSelected ? list.getSelectionBackground() : list.getBackground());
-
+            setBackground(isSelected ? list.getSelectionBackground() : list.getBackground());
             if (value instanceof PlottedEnvelope.StrategyCurve s) {
-                JPanel swatch = new JPanel();
                 swatch.setBackground(s.color());
-                swatch.setPreferredSize(new Dimension(14, 14));
-                swatch.setBorder(BorderFactory.createLineBorder(Color.DARK_GRAY));
-
-                JPanel swatchWrap = new JPanel(new GridBagLayout());
-                swatchWrap.setOpaque(false);
-                swatchWrap.add(swatch);
-                row.add(swatchWrap, BorderLayout.WEST);
-
-                JPanel textStack = new JPanel(new GridLayout(2, 1, 0, 1));
-                textStack.setOpaque(false);
-
-                String titleText = s.label() + " (deg " + Math.max(0, s.polynomial().degree()) + ")  "
-                        + s.activeIntervalsSummary();
-                JLabel top = new JLabel(titleText);
-                top.setFont(top.getFont().deriveFont(Font.BOLD, 11.5f));
-                top.setForeground(isSelected ? list.getSelectionForeground() : new Color(0x11, 0x18, 0x27));
-
-                String polyStr = s.polynomial().toString();
-                if (polyStr.length() > 34) {
-                    polyStr = polyStr.substring(0, 31) + "...";
-                }
-                JLabel bottom = new JLabel(polyStr);
-                bottom.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-                bottom.setForeground(isSelected ? list.getSelectionForeground() : new Color(0x4B, 0x55, 0x63));
-
-                textStack.add(top);
-                textStack.add(bottom);
-                row.add(textStack, BorderLayout.CENTER);
-                return row;
+                topLabel.setText(s.label() + " (deg " + Math.max(0, s.polynomial().degree()) + ")  "
+                        + s.activeIntervalsSummary());
+                topLabel.setForeground(isSelected ? list.getSelectionForeground() : new Color(0x11, 0x18, 0x27));
+                bottomLabel.setText(s.shortPolySummary());
+                bottomLabel.setForeground(isSelected ? list.getSelectionForeground() : new Color(0x4B, 0x55, 0x63));
+                return this;
             }
-            return super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+            topLabel.setText(value != null ? value.toString() : "");
+            bottomLabel.setText("");
+            return this;
         }
     }
 

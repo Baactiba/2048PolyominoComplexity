@@ -15,7 +15,7 @@ if not defined JAVAW (
 
 if not defined JAVAW goto :no_java
 
-start "" "%JAVAW%" -Xmx32G -jar "%JAR%"
+start "" "%JAVAW%" -Xmx64G -jar "%JAR%"
 exit /b 0
 
 :no_jar
